@@ -187,3 +187,34 @@ The fixes:
   being re-applied.
 
 Both are now covered by the scenario's test.
+
+---
+
+## 4. The brownfield scenario with a live local model
+
+`python -m agentflow run brownfield --provider ollama`, with `qwen2.5-coder:7b` served by
+Ollama on a 16-core laptop CPU (about 13 tokens/s). Evidence:
+[sample-runs/llm-brownfield](sample-runs/llm-brownfield/report.md).
+
+| Step | What the model produced | What the governance did |
+|---|---|---|
+| Requirements | `url_safety`, `click_accuracy` (10 s) | accepted after validation against the vocabulary; `expiry` added by the deterministic rules |
+| `impl.url_validation` | deleted `import os` (still used), used `InvalidURL` without importing it, a scheme *denylist* instead of an allowlist | lint and tests failed → **rolled back** → fallback agent passed |
+| `impl.click_accuracy` | claimed the code "already" did atomic increments and 302s (it did not) | `test_redirect_is_not_permanently_cacheable` failed → **rolled back** → fallback passed |
+| `impl.expiry` | a `store.py` that does not parse | **blocked by policy (SEC-000)** before touching disk → fallback passed, then human approval of the migration |
+
+Result: released 0.5.0, 22 tests, 99% coverage, audit chain intact. 248 s active time,
+8,173 tokens, 3 retries, 2 rollbacks, 1 policy block, MTTR 1.4 s.
+
+What this shows: a 7B local model is useful for requirement analysis but not yet for
+multi-file brownfield patches. The orchestrator's job is to make that safe. No
+unverified line reached the release, and every rejected attempt is preserved in
+`changes/` and the audit trail. A larger model (14B+) or Claude should convert more
+first attempts. That is now a measurable property: the attempt success rate is 0.79 for
+this run vs 1.0 deterministic.
+
+An earlier attempt at this run failed for a different reason, and the failure was useful:
+the model also proposed `analytics` ("click counts"), the design then promised a stats
+endpoint linkly does not have, and the docs stage's OpenAPI gate stopped the release.
+Model-suggested capabilities now go through the same refinement rules as the
+deterministic analysis (`tests/test_agents.py::test_model_capabilities_follow_the_same_refinement_rules`).

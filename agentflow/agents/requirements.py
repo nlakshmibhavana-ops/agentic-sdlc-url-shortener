@@ -164,8 +164,13 @@ class LLMRequirementsAgent(Agent):
         answers = ctx.store.get("human_answers", {}) or {}
         req, decisions = build_requirements(text, answers, ctx.scenario["title"])
         have = {c["id"] for c in req["capabilities"]}
+        everything = have | set(parsed.capabilities)
+        # The same refinement rules as the deterministic path: a specific capability in the
+        # request overrides the generic one it mentions in passing.
+        refined = {g for s_, gs in knowledge.REFINES.items() if s_ in everything for g in gs}
+        dropped = sorted((set(parsed.capabilities) - have) & refined)
         for cap in parsed.capabilities:
-            if cap not in have:
+            if cap not in have and cap not in refined:
                 req["capabilities"].append(
                     {
                         "id": cap,
@@ -174,4 +179,7 @@ class LLMRequirementsAgent(Agent):
                     }
                 )
         req["model_ambiguities"] = parsed.ambiguities
-        return AgentResult(artifacts={"requirements": req}, decisions=decisions, tokens=tokens)
+        notes = [f"model suggested {sorted(parsed.capabilities)}"]
+        if dropped:
+            notes.append(f"dropped {dropped}: refined by a more specific capability in the request")
+        return AgentResult(artifacts={"requirements": req}, decisions=decisions, tokens=tokens, notes=notes)

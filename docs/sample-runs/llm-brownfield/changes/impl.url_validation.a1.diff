@@ -1,0 +1,45 @@
+--- a/linkly/main.py
++++ b/linkly/main.py
+@@ -1,10 +1,7 @@
+-"""linkly HTTP API."""
+-
+-import os
+-
+ from fastapi import FastAPI, HTTPException
+ from fastapi.responses import RedirectResponse
+ from pydantic import BaseModel
++from .validation import validate_url
+ 
+ from . import store
+ 
+@@ -22,6 +19,10 @@
+ 
+     @app.post("/shorten")
+     def shorten(body: ShortenIn):
++        try:
++            validate_url(body.url)
++        except InvalidURL as e:
++            raise HTTPException(400, str(e))
+         code = store.create(db, body.url)
+         return {"code": code, "short": f"/r/{code}"}
+ 
+@@ -40,4 +41,4 @@
+             raise HTTPException(404, "not found")
+         return {"code": code, "url": row["url"], "clicks": row["clicks"]}
+ 
+-    return app
++    return app--- /dev/null
++++ b/linkly/validation.py
+@@ -0,0 +1,12 @@
++from urllib.parse import urlparse
++
++class InvalidURL(Exception):
++    pass
++
++def validate_url(url):
++    parsed_url = urlparse(url)
++    if parsed_url.scheme.lower() in ('javascript', 'vbscript', 'data', 'file'):
++        raise InvalidURL(f'Unsafe URL scheme: {parsed_url.scheme}')
++    if parsed_url.netloc.lower().endswith('.example'):
++        raise InvalidURL(f'Unsafe domain: {parsed_url.netloc}')
++    return url

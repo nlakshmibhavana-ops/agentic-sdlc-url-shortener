@@ -1,0 +1,39 @@
+{
+  "requests": {
+    "impl.expiry@df7dd753712dbf5c": {
+      "node": "impl.expiry",
+      "subject": "df7dd753712dbf5c",
+      "summary": "LINK-150: optional expires_in_days; 410 Gone after expiry; in-place schema migration\nchange: Same change plus an idempotent ALTER TABLE migration for existing databases (digest df7dd753712dbf5c)\nfiles: linkly/main.py, linkly/store.py\nValidation evidence:\n[x] compiles: 2 files compile\n[x] lint: ruff clean\n[x] tests: ['tests/test_api.py', 'tests/test_expiry.py', 'tests/test_migration.py']: 8 passed in 0.17s",
+      "reasons": [
+        "DATA-001 linkly/store.py: schema change against an existing database"
+      ],
+      "requested_at": 1791312592.37052
+    },
+    "release@16b732d5dda11f03": {
+      "node": "release",
+      "subject": "16b732d5dda11f03",
+      "summary": "Cut the release (version, notes) after human approval\nchange: Release 0.5.0 (digest 16b732d5dda11f03)\nfiles: RELEASE_NOTES.md, VERSION, pyproject.toml\n[x] all tests pass: 22 passed / 0 failed\n[x] coverage >= 85%: 99.0%\n[x] lint clean: 0 issues\n[x] no security findings: 0 findings\n[x] docs generated: openapi.json, docs/API.md, docs/DESIGN.md, CHANGELOG.md\n[x] no blocking questions open: []\nValidation evidence:\n[x] smoke: ok POST /shorten -> 200\nok GET /r/1 -> 302\nok POST /shorten -> 400\nok GET /info/1 -> 200",
+      "reasons": [
+        "high-impact stage 'release'",
+        "CHG-002 pyproject.toml: modifies a protected file"
+      ],
+      "requested_at": 1791312598.475125
+    }
+  },
+  "decisions": {
+    "impl.expiry@df7dd753712dbf5c": {
+      "status": "approved",
+      "by": "reviewer",
+      "comment": "migration verified by the v0.4 upgrade test",
+      "decided_at": 1791312592.7449536,
+      "waited_s": 0.4
+    },
+    "release@16b732d5dda11f03": {
+      "status": "approved",
+      "by": "reviewer",
+      "comment": "",
+      "decided_at": 1791312598.8531902,
+      "waited_s": 0.4
+    }
+  }
+}

@@ -27,7 +27,7 @@ Requires Python 3.11+ (developed on 3.12).
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e .                 # add '.[claude]' for the optional Claude backend
-pytest                           # 43 orchestrator tests, ~90 s (they run real scenarios)
+pytest                           # 47 orchestrator tests, ~90 s (they run real scenarios)
 python -m agentflow run greenfield   # interactive: watch it build, approve the release
 ./scripts/demo.sh                # all three scenarios, non-interactive, ~1 min
 ```

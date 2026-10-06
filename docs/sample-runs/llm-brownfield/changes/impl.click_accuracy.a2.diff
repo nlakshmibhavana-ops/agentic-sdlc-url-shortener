@@ -1,0 +1,35 @@
+--- a/linkly/main.py
++++ b/linkly/main.py
+@@ -36,7 +36,10 @@
+         if not row:
+             raise HTTPException(404, "not found")
+         store.hit(db, code)
+-        return RedirectResponse(row["url"], status_code=301)
++        # 302 + no-store: a cached 301 never reaches us again, so clicks went uncounted.
++        return RedirectResponse(
++            row["url"], status_code=302, headers={"Cache-Control": "private, no-store"}
++        )
+ 
+     @app.get("/info/{code}")
+     def info(code: str):
+--- a/linkly/store.py
++++ b/linkly/store.py
+@@ -12,7 +12,7 @@
+ def connect(path):
+     conn = getattr(_local, "conn", None)
+     if conn is None or getattr(_local, "path", None) != path:
+-        conn = sqlite3.connect(path)
++        conn = sqlite3.connect(path, timeout=10.0)
+         conn.row_factory = sqlite3.Row
+         _local.conn, _local.path = conn, path
+     return conn
+@@ -54,7 +54,7 @@
+ 
+ 
+ def hit(path, code):
++    # Single atomic statement: the old read-modify-write lost updates under load.
+     conn = connect(path)
+-    row = conn.execute("SELECT clicks FROM urls WHERE code = ?", (code,)).fetchone()
+-    conn.execute("UPDATE urls SET clicks = ? WHERE code = ?", (row["clicks"] + 1, code))
++    conn.execute("UPDATE urls SET clicks = clicks + 1 WHERE code = ?", (code,))
+     conn.commit()

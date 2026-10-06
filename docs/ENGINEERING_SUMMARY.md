@@ -135,11 +135,13 @@ guardrails.
   Requirements analysis, codebase analysis, design, planning (selection, ordering,
   serialisation, regression selection, checkpoints), test running, review, docs and
   release are computed, not replayed.
-* **The Claude path** (`--provider claude`) is implemented with the current SDK:
-  structured outputs, adaptive thinking and server-side refusal fallback. Its
-  *fallback* behaviour is tested with a simulated outage. I have **not** included live
-  LLM runs: they need an API key and are non-deterministic. Expect more retries in that
-  mode, which is what the retry, feedback and fallback machinery is for.
+* **LLM providers.** The **Ollama** path ran live end to end (brownfield, qwen2.5-coder 7B
+  on a laptop CPU; see SCENARIOS.md section 4). Every model-written implementation was
+  rejected by the gates or policy and replaced by the fallback agent, which is the
+  machinery working, not the model succeeding. The **Claude** path is implemented with
+  the current SDK (structured outputs, adaptive thinking, server-side refusal fallback)
+  and its fallback is tested with a simulated outage, but it has **not** been run live:
+  that needs an API key.
 * Capability vocabulary and questions are a curated catalogue. A requirement outside it
   is rejected (`no recognisable capability`) rather than mis-handled. That is safe, but
   it limits generality.
@@ -180,7 +182,7 @@ Three layers:
    * LLM outage fallback
    * parallel-span overlap
 
-`pytest` → 43 passed (~90 s). `ruff check .` is clean. `scripts/demo.sh` runs all three
+`pytest` → 47 passed (~90 s). `ruff check .` is clean. `scripts/demo.sh` runs all three
 scenarios end to end and verifies the audit chains.
 
 **Engine defects the scenarios found during development** (each fixed and covered):
@@ -196,8 +198,9 @@ scenarios end to end and verifies the audit chains.
 
 ## 7. What I would do next
 
-* Run the Claude provider against the scenarios and record retry/fallback rates as a
-  baseline. Add an eval set of requirements outside the catalogue.
+* Run larger local models (14B+) and Claude against the scenarios and track the
+  first-attempt success rate per model as an eval baseline (7B: 0/3 implementation
+  attempts accepted). Add an eval set of requirements outside the catalogue.
 * Replace the heuristic scanners with real tools (Semgrep, gitleaks, pip-audit) as gates.
   Add mutation testing as a gate on test-authoring tasks.
 * Real identities for approvers (OIDC). Two-person rule for `DATA-*` and release.

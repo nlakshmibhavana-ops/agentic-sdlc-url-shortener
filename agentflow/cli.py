@@ -361,7 +361,12 @@ def main(argv: list[str] | None = None) -> int:
         run_dir = _run_dir(args.run)
         st = RunState(run_dir)
         broker = ApprovalBroker(run_dir / "approvals.json", AuditLog(run_dir / "audit.jsonl", st.run_id))
-        decision = broker.decide(args.node, not args.reject, args.by, args.comment)
+        try:
+            decision = broker.decide(args.node, not args.reject, args.by, args.comment)
+        except (KeyError, ValueError) as exc:
+            print(red(exc.args[0] if exc.args else str(exc)))
+            _print_pending(run_dir)
+            return 1
         print(f"{args.node}: {decision['status']} by {args.by}. Run `resume` to continue.")
         return 0
     if args.cmd == "answer":

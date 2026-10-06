@@ -59,3 +59,40 @@ def test_planner_refuses_uncovered_capabilities():
     req["capabilities"].append({"id": "click_accuracy", "source": "x", "acceptance_criteria": ["x"]})
     with pytest.raises(AgentError, match="no task covers"):
         make_plan("shortener", req, None)
+
+
+class ScriptedLLM:
+    """A model that over-extracts: it adds 'analytics' for a click-count bug report."""
+
+    async def structured(self, system, prompt, schema):
+        return schema(
+            capabilities=["url_safety", "click_accuracy", "expiry", "analytics"],
+            evidence={},
+            ambiguities=[],
+        ), 10
+
+
+def test_model_capabilities_follow_the_same_refinement_rules(tmp_path):
+    import asyncio
+
+    from agentflow.agents.base import AgentContext
+    from agentflow.agents.requirements import LLMRequirementsAgent
+    from agentflow.context import ContextStore
+    from agentflow.models import Node
+    from agentflow.workspace import Workspace
+
+    store = ContextStore()
+    store.put("requirement_text", scenario_mod.load("brownfield")["requirement"], "scenario")
+    ctx = AgentContext(
+        Node("requirements", "stage", "requirements.llm", "r"),
+        store,
+        Workspace(tmp_path),
+        {"title": "t", "playbook": "linkly"},
+        1,
+        tmp_path,
+        asyncio.Lock(),
+        llm=ScriptedLLM(),
+    )
+    result = asyncio.run(LLMRequirementsAgent().run(ctx))
+    assert caps(result.artifacts["requirements"]) == {"url_safety", "click_accuracy", "expiry"}
+    assert any("dropped ['analytics']" in n for n in result.notes)
