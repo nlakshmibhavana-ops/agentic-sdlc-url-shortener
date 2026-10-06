@@ -1,0 +1,94 @@
+--- a/shortener/config.py
++++ b/shortener/config.py
+@@ -20,6 +20,7 @@
+     max_url_length: int = 2048
+     rate_limit_per_minute: int = 60
+     allow_private_targets: bool = False
++    blocked_domains: tuple[str, ...] = ()
+     redirect_cache_size: int = 10_000
+     redirect_cache_ttl_s: float = 30.0  # bounds staleness across instances
+ 
+@@ -33,5 +34,6 @@
+             code_length=int(env.get("SHORTENER_CODE_LENGTH", cls.code_length)),
+             rate_limit_per_minute=int(env.get("SHORTENER_RATE_LIMIT", cls.rate_limit_per_minute)),
+             allow_private_targets=env.get("SHORTENER_ALLOW_PRIVATE", "") == "1",
++            blocked_domains=_csv(env.get("SHORTENER_BLOCKED_DOMAINS", "").lower()),
+             redirect_cache_ttl_s=float(env.get("SHORTENER_CACHE_TTL", cls.redirect_cache_ttl_s)),
+         )
+--- a/shortener/service.py
++++ b/shortener/service.py
+@@ -93,6 +93,7 @@
+             max_length=self.settings.max_url_length,
+             base_url=self.settings.base_url,
+             allow_private=self.settings.allow_private_targets,
++            blocked_domains=self.settings.blocked_domains,
+         )
+         now = self.clock()
+         if expires_at is not None:
+--- a/shortener/validation.py
++++ b/shortener/validation.py
+@@ -25,7 +25,12 @@
+ 
+ 
+ def validate_target_url(
+-    url: str, *, max_length: int, base_url: str, allow_private: bool = False
++    url: str,
++    *,
++    max_length: int,
++    base_url: str,
++    allow_private: bool = False,
++    blocked_domains: tuple[str, ...] = (),
+ ) -> str:
+     """Return the normalised URL or raise InvalidURL."""
+     url = url.strip()
+@@ -51,6 +56,8 @@
+         raise InvalidURL("url host is not a valid domain name") from exc
+     if not allow_private and _is_private_host(host):
+         raise InvalidURL("private, loopback and internal hosts are not allowed")
++    if any(host == d or host.endswith("." + d) for d in blocked_domains):
++        raise InvalidURL("target domain is blocked")
+     if host == (urlsplit(base_url).hostname or "").lower():
+         raise InvalidURL("cannot shorten a link to this service")
+ 
+--- /dev/null
++++ b/tests/unit/test_denylist.py
+@@ -0,0 +1,39 @@
++"""Q-SAFETY: configurable domain denylist (including subdomains)."""
++
++import pytest
++
++from shortener.validation import InvalidURL, validate_target_url
++
++BLOCKED = ("evil.example", "phish.test")
++
++
++def check(url):
++    return validate_target_url(
++        url, max_length=2048, base_url="http://sho.rt", blocked_domains=BLOCKED
++    )
++
++
++@pytest.mark.parametrize(
++    "url", ["https://evil.example/x", "https://login.evil.example/", "http://PHISH.test"]
++)
++def test_blocked_domains_and_subdomains(url):
++    with pytest.raises(InvalidURL, match="blocked"):
++        check(url)
++
++
++@pytest.mark.parametrize("url", ["https://notevil.example/", "https://evil.example.com/"])
++def test_similar_but_different_domains_allowed(url):
++    assert check(url)
++
++
++def test_denylist_applies_through_the_service(tmp_path):
++    from shortener.config import Settings
++    from shortener.db import Database
++    from shortener.repository import LinkRepository
++    from shortener.service import LinkService
++
++    db = Database(str(tmp_path / "d.db"))
++    db.migrate()
++    service = LinkService(LinkRepository(db), Settings(blocked_domains=BLOCKED))
++    with pytest.raises(InvalidURL):
++        service.create("https://evil.example/", "owner")

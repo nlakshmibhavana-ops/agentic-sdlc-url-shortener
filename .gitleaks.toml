@@ -1,0 +1,8 @@
+# Allowlist for documented placeholders and scanner test fixtures only.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholder API keys in docs/examples and the secret-scanner's own test fixture"
+paths = ['''tests/test_policy\.py''', '''^runs/''', '''__pycache__''']
+regexes = ['''change-me''', '''dev-key''', '''smoke-key''']

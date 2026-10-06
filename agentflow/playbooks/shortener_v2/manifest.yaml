@@ -1,0 +1,324 @@
+# Change catalogue for "make links safer, faster, with marketing analytics" (ambiguous).
+# Which tasks are selected depends on how the clarifying questions are answered.
+name: shortener_v2
+package: shortener
+coverage_min: 90
+docs:
+  openapi_factory: shortener.api:create_app
+  env: {SHORTENER_DB: ":memory:"}
+serve_env: {SHORTENER_DB: "{run_dir}/service.db", SHORTENER_API_KEYS: dev-key}
+smoke_env: {SHORTENER_DB: "{run_dir}/smoke.db", SHORTENER_API_KEYS: smoke-key}
+smoke:
+  - {method: GET, path: /readyz, expect: 200}
+  - {method: POST, path: /api/v1/links, json: {url: "https://example.com/smoke"}, headers: {X-API-Key: smoke-key}, expect: 201, save: code}
+  - {method: GET, path: "/{code}", expect: 302}
+  - {method: GET, path: "/api/v1/links/{code}/stats", headers: {X-API-Key: smoke-key}, expect: 200}
+tasks:
+  - id: perf.redirect_cache
+    title: "Q-PERF: bounded TTL read-through cache on the redirect path (p95 < 50 ms)"
+    capabilities: [redirect_cache]
+    writes: [shortener/cache.py, shortener/config.py, shortener/service.py,
+             tests/unit/test_cache.py, tests/integration/test_performance.py]
+    verify: [tests/unit/test_cache.py, tests/integration/test_performance.py, tests]
+    ops:
+      - {op: write, path: shortener/cache.py, src: files/shortener/cache.py}
+      - {op: write, path: tests/unit/test_cache.py, src: files/tests/unit/test_cache.py}
+      - {op: write, path: tests/integration/test_performance.py, src: files/tests/integration/test_performance.py}
+      - op: edit
+        path: shortener/config.py
+        old: |2
+              allow_private_targets: bool = False
+        new: |2
+              allow_private_targets: bool = False
+              redirect_cache_size: int = 10_000
+              redirect_cache_ttl_s: float = 30.0  # bounds staleness across instances
+      - op: edit
+        path: shortener/config.py
+        old: |2
+                      allow_private_targets=env.get("SHORTENER_ALLOW_PRIVATE", "") == "1",
+        new: |2
+                      allow_private_targets=env.get("SHORTENER_ALLOW_PRIVATE", "") == "1",
+                      redirect_cache_ttl_s=float(env.get("SHORTENER_CACHE_TTL", cls.redirect_cache_ttl_s)),
+      - op: edit
+        path: shortener/service.py
+        old: |2
+          from .codes import generate_code, validate_alias
+        new: |2
+          from .cache import TTLCache
+          from .codes import generate_code, validate_alias
+      - op: edit
+        path: shortener/service.py
+        old: |2
+                  self.clock = clock
+        new: |2
+                  self.clock = clock
+                  self.cache: TTLCache[Link] = TTLCache(
+                      settings.redirect_cache_size, settings.redirect_cache_ttl_s
+                  )
+      - op: edit
+        path: shortener/service.py
+        old: |2
+                  """Look up a link for redirecting. Raises LinkNotFound or LinkGone."""
+                  link = self.repo.get(code)
+                  if link is None:
+                      raise LinkNotFound(code)
+        new: |2
+                  """Look up a link for redirecting. Raises LinkNotFound or LinkGone."""
+                  link = self.cache.get(code)
+                  if link is None:
+                      link = self.repo.get(code)
+                      if link is None:  # misses are not cached: a new alias must work at once
+                          raise LinkNotFound(code)
+                      self.cache.set(code, link)
+                  # Expiry/deletion are still checked on every hit, cached or not.
+      - op: edit
+        path: shortener/service.py
+        old: |2
+                  self.repo.soft_delete(code, self.clock())
+        new: |2
+                  self.repo.soft_delete(code, self.clock())
+                  self.cache.invalidate(code)
+
+  - id: safety.domain_denylist
+    title: "Q-SAFETY: configurable domain denylist (incl. subdomains)"
+    capabilities: [domain_denylist]
+    writes: [shortener/config.py, shortener/validation.py, shortener/service.py,
+             tests/unit/test_denylist.py]
+    verify: [tests/unit/test_denylist.py, tests]
+    ops:
+      - {op: write, path: tests/unit/test_denylist.py, src: files/tests/unit/test_denylist.py}
+      - op: edit
+        path: shortener/config.py
+        old: |2
+              allow_private_targets: bool = False
+        new: |2
+              allow_private_targets: bool = False
+              blocked_domains: tuple[str, ...] = ()
+      - op: edit
+        path: shortener/config.py
+        old: |2
+                      allow_private_targets=env.get("SHORTENER_ALLOW_PRIVATE", "") == "1",
+        new: |2
+                      allow_private_targets=env.get("SHORTENER_ALLOW_PRIVATE", "") == "1",
+                      blocked_domains=_csv(env.get("SHORTENER_BLOCKED_DOMAINS", "").lower()),
+      - op: edit
+        path: shortener/validation.py
+        old: |2
+              url: str, *, max_length: int, base_url: str, allow_private: bool = False
+          ) -> str:
+        new: |2
+              url: str,
+              *,
+              max_length: int,
+              base_url: str,
+              allow_private: bool = False,
+              blocked_domains: tuple[str, ...] = (),
+          ) -> str:
+      - op: edit
+        path: shortener/validation.py
+        old: |2
+              if host == (urlsplit(base_url).hostname or "").lower():
+        new: |2
+              if any(host == d or host.endswith("." + d) for d in blocked_domains):
+                  raise InvalidURL("target domain is blocked")
+              if host == (urlsplit(base_url).hostname or "").lower():
+      - op: edit
+        path: shortener/service.py
+        old: |2
+                      allow_private=self.settings.allow_private_targets,
+        new: |2
+                      allow_private=self.settings.allow_private_targets,
+                      blocked_domains=self.settings.blocked_domains,
+
+  - id: analytics.unique_visitors
+    title: "Q-PRIVACY=hashed: unique visitors via daily-rotating HMAC; raw IPs never stored"
+    capabilities: [unique_visitors]
+    writes: [shortener/db.py, shortener/config.py, shortener/repository.py, shortener/service.py,
+             shortener/models.py, shortener/api.py, tests/unit/test_visitors.py]
+    verify: [tests/unit/test_visitors.py, tests]
+    ops:
+      - {op: write, path: tests/unit/test_visitors.py, src: files/tests/unit/test_visitors.py}
+      - op: edit
+        path: shortener/db.py
+        old: |2
+                  """,
+              ),
+          ]
+        new: |2
+                  """,
+              ),
+              (
+                  "0002_visitor_hash",
+                  """
+                  ALTER TABLE clicks ADD COLUMN visitor_hash TEXT;
+                  CREATE INDEX idx_clicks_code_visitor ON clicks(code, visitor_hash);
+                  """,
+              ),
+          ]
+      - op: edit
+        path: shortener/config.py
+        old: |2
+              allow_private_targets: bool = False
+        new: |2
+              allow_private_targets: bool = False
+              # Key for visitor hashes. Unset: a random per-process key (uniques reset on restart).
+              analytics_key: str = ""
+      - op: edit
+        path: shortener/config.py
+        old: |2
+                      allow_private_targets=env.get("SHORTENER_ALLOW_PRIVATE", "") == "1",
+        new: |2
+                      allow_private_targets=env.get("SHORTENER_ALLOW_PRIVATE", "") == "1",
+                      analytics_key=env.get("SHORTENER_ANALYTICS_KEY", ""),
+      - op: edit
+        path: shortener/repository.py
+        old: |2
+              user_agent_family: str
+        new: |2
+              user_agent_family: str
+              visitor_hash: str | None = None
+      - op: edit
+        path: shortener/repository.py
+        old: |2
+                          "INSERT INTO clicks (code, clicked_at, referrer_host, user_agent_family)"
+                          " VALUES (?, ?, ?, ?)",
+                          (code, click.clicked_at.isoformat(), click.referrer_host, click.user_agent_family),
+        new: |2
+                          "INSERT INTO clicks (code, clicked_at, referrer_host, user_agent_family,"
+                          " visitor_hash) VALUES (?, ?, ?, ?, ?)",
+                          (
+                              code,
+                              click.clicked_at.isoformat(),
+                              click.referrer_host,
+                              click.user_agent_family,
+                              click.visitor_hash,
+                          ),
+      - op: edit
+        path: shortener/repository.py
+        old: |2
+              def top_referrers(self, code: str, limit: int = 5) -> list[tuple[str, int]]:
+        new: |2
+              def unique_visitors(self, code: str, since: datetime) -> int:
+                  """Distinct daily visitor hashes; the key rotates daily, so this is the sum of
+                  daily uniques over the window (a returning visitor counts once per day)."""
+                  row = (
+                      self.db.connection()
+                      .execute(
+                          "SELECT COUNT(DISTINCT visitor_hash) AS n FROM clicks"
+                          " WHERE code = ? AND clicked_at >= ? AND visitor_hash IS NOT NULL",
+                          (code, since.isoformat()),
+                      )
+                      .fetchone()
+                  )
+                  return row["n"]
+
+              def top_referrers(self, code: str, limit: int = 5) -> list[tuple[str, int]]:
+      - op: edit
+        path: shortener/service.py
+        old: |2
+          import hashlib
+        new: |2
+          import hashlib
+          import hmac
+          import secrets
+      - op: edit
+        path: shortener/service.py
+        old: |2
+              top_referrers: list[tuple[str, int]]
+        new: |2
+              top_referrers: list[tuple[str, int]]
+              unique_visitors: int = 0
+      - op: edit
+        path: shortener/service.py
+        old: |2
+                  self.clock = clock
+        new: |2
+                  self.clock = clock
+                  self._visitor_key = (settings.analytics_key or secrets.token_hex(32)).encode()
+      - op: edit
+        path: shortener/service.py
+        old: |2
+              def record_click(self, code: str, referrer: str | None, user_agent: str | None) -> None:
+                  referrer_host = urlsplit(referrer).hostname if referrer else None
+                  self.repo.record_click(
+                      code, Click(self.clock(), referrer_host, user_agent_family(user_agent))
+                  )
+        new: |2
+              def visitor_hash(self, client_ip: str | None, user_agent: str | None) -> str | None:
+                  """Keyed hash of (day, IP, UA). The raw IP never leaves this function."""
+                  if not client_ip:
+                      return None
+                  message = f"{self.clock().date().isoformat()}|{client_ip}|{user_agent or ''}"
+                  return hmac.new(self._visitor_key, message.encode(), hashlib.sha256).hexdigest()[:16]
+
+              def record_click(
+                  self,
+                  code: str,
+                  referrer: str | None,
+                  user_agent: str | None,
+                  client_ip: str | None = None,
+              ) -> None:
+                  referrer_host = urlsplit(referrer).hostname if referrer else None
+                  click = Click(
+                      self.clock(),
+                      referrer_host,
+                      user_agent_family(user_agent),
+                      self.visitor_hash(client_ip, user_agent),
+                  )
+                  self.repo.record_click(code, click)
+      - op: edit
+        path: shortener/service.py
+        old: |2
+                      top_referrers=self.repo.top_referrers(code),
+        new: |2
+                      top_referrers=self.repo.top_referrers(code),
+                      unique_visitors=self.repo.unique_visitors(code, since),
+      - op: edit
+        path: shortener/models.py
+        old: |2
+              top_referrers: list[ReferrerCount]
+        new: |2
+              top_referrers: list[ReferrerCount]
+              unique_visitors: int = Field(
+                  0, description="Daily-unique visitors summed over the window (no IPs stored)"
+              )
+      - op: edit
+        path: shortener/api.py
+        old: |2
+                      top_referrers=[ReferrerCount(host=h, clicks=n) for h, n in stats.top_referrers],
+        new: |2
+                      top_referrers=[ReferrerCount(host=h, clicks=n) for h, n in stats.top_referrers],
+                      unique_visitors=stats.unique_visitors,
+      - op: edit
+        path: shortener/api.py
+        old: |2
+                  code: str,
+                  background: BackgroundTasks,
+        new: |2
+                  code: str,
+                  request: Request,
+                  background: BackgroundTasks,
+      - op: edit
+        path: shortener/api.py
+        old: |2
+                  background.add_task(service.record_click, link.code, referer, user_agent)
+        new: |2
+                  client_ip = request.client.host if request.client else None  # hashed, never stored
+                  background.add_task(service.record_click, link.code, referer, user_agent, client_ip)
+
+  - id: analytics.unique_visitors_raw
+    title: "Q-PRIVACY=raw: store client IPs for unique visitors"
+    capabilities: [unique_visitors_raw]
+    writes: [shortener/db.py]
+    ops:
+      - op: edit
+        path: shortener/db.py
+        old: |2
+                  """,
+              ),
+          ]
+        new: |2
+                  """,
+              ),
+              ("0002_client_ip", "ALTER TABLE clicks ADD COLUMN client_ip TEXT"),
+          ]

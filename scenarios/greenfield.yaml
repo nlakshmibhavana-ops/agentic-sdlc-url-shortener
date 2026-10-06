@@ -1,0 +1,15 @@
+id: greenfield
+title: "URL shortener service, from scratch"
+pipeline: greenfield
+playbook: shortener
+base: null
+requirement: |
+  Build a URL shortener service with a versioned REST API.
+  Authenticated clients (API key) can create short links for http/https URLs, optionally with a custom alias and an expiry time.
+  Visiting a short link must redirect to the target; unknown links return 404 and deleted or expired links return 410.
+  Owners can view link details, delete links and see click analytics: total clicks, clicks per day and top referrer hosts.
+  Store no IP addresses or other personal data for analytics.
+  Reject unsafe targets such as javascript: URLs, embedded credentials and internal hosts.
+  Rate limit link creation per API key (60 per minute) and make creation safe to retry with an idempotency key.
+  Expose health and readiness endpoints and propagate a request id on every response.
+budgets: {max_attempts: 60, max_active_s: 900}

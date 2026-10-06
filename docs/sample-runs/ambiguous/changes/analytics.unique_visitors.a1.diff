@@ -1,0 +1,250 @@
+--- a/shortener/api.py
++++ b/shortener/api.py
+@@ -196,19 +196,22 @@
+             total_clicks=stats.total_clicks,
+             daily=[DailyClicks(date=d, clicks=n) for d, n in stats.daily],
+             top_referrers=[ReferrerCount(host=h, clicks=n) for h, n in stats.top_referrers],
++            unique_visitors=stats.unique_visitors,
+         )
+ 
+     # Registered last so it never shadows the routes above.
+     @app.get("/{code}", status_code=302, responses=ERROR_RESPONSES, tags=["redirect"])
+     def follow(
+         code: str,
++        request: Request,
+         background: BackgroundTasks,
+         referer: Annotated[str | None, Header()] = None,
+         user_agent: Annotated[str | None, Header()] = None,
+     ) -> RedirectResponse:
+         link = service.resolve(code)
+         # Recorded after the response is sent, so analytics never slows the redirect.
+-        background.add_task(service.record_click, link.code, referer, user_agent)
++        client_ip = request.client.host if request.client else None  # hashed, never stored
++        background.add_task(service.record_click, link.code, referer, user_agent, client_ip)
+         # 302 + no-store (not 301) so every click reaches us and is counted.
+         return RedirectResponse(
+             link.target_url, status_code=302, headers={"Cache-Control": "private, no-store"}
+--- a/shortener/config.py
++++ b/shortener/config.py
+@@ -20,6 +20,8 @@
+     max_url_length: int = 2048
+     rate_limit_per_minute: int = 60
+     allow_private_targets: bool = False
++    # Key for visitor hashes. Unset: a random per-process key (uniques reset on restart).
++    analytics_key: str = ""
+     blocked_domains: tuple[str, ...] = ()
+     redirect_cache_size: int = 10_000
+     redirect_cache_ttl_s: float = 30.0  # bounds staleness across instances
+@@ -34,6 +36,7 @@
+             code_length=int(env.get("SHORTENER_CODE_LENGTH", cls.code_length)),
+             rate_limit_per_minute=int(env.get("SHORTENER_RATE_LIMIT", cls.rate_limit_per_minute)),
+             allow_private_targets=env.get("SHORTENER_ALLOW_PRIVATE", "") == "1",
++            analytics_key=env.get("SHORTENER_ANALYTICS_KEY", ""),
+             blocked_domains=_csv(env.get("SHORTENER_BLOCKED_DOMAINS", "").lower()),
+             redirect_cache_ttl_s=float(env.get("SHORTENER_CACHE_TTL", cls.redirect_cache_ttl_s)),
+         )
+--- a/shortener/db.py
++++ b/shortener/db.py
+@@ -38,6 +38,13 @@
+             created_at   TEXT NOT NULL,
+             PRIMARY KEY (owner, key)
+         );
++        """,
++    ),
++    (
++        "0002_visitor_hash",
++        """
++        ALTER TABLE clicks ADD COLUMN visitor_hash TEXT;
++        CREATE INDEX idx_clicks_code_visitor ON clicks(code, visitor_hash);
+         """,
+     ),
+ ]
+--- a/shortener/models.py
++++ b/shortener/models.py
+@@ -39,6 +39,9 @@
+     total_clicks: int
+     daily: list[DailyClicks]
+     top_referrers: list[ReferrerCount]
++    unique_visitors: int = Field(
++        0, description="Daily-unique visitors summed over the window (no IPs stored)"
++    )
+ 
+ 
+ class ErrorResponse(BaseModel):
+--- a/shortener/repository.py
++++ b/shortener/repository.py
+@@ -29,6 +29,7 @@
+     clicked_at: datetime
+     referrer_host: str | None
+     user_agent_family: str
++    visitor_hash: str | None = None
+ 
+ 
+ def _dt(value: str | None) -> datetime | None:
+@@ -83,9 +84,15 @@
+         # One transaction, and an atomic increment: no lost updates under concurrent clicks.
+         with self.db.transaction() as tx:
+             tx.execute(
+-                "INSERT INTO clicks (code, clicked_at, referrer_host, user_agent_family)"
+-                " VALUES (?, ?, ?, ?)",
+-                (code, click.clicked_at.isoformat(), click.referrer_host, click.user_agent_family),
++                "INSERT INTO clicks (code, clicked_at, referrer_host, user_agent_family,"
++                " visitor_hash) VALUES (?, ?, ?, ?, ?)",
++                (
++                    code,
++                    click.clicked_at.isoformat(),
++                    click.referrer_host,
++                    click.user_agent_family,
++                    click.visitor_hash,
++                ),
+             )
+             tx.execute("UPDATE links SET click_count = click_count + 1 WHERE code = ?", (code,))
+ 
+@@ -96,6 +103,20 @@
+             (code, since.isoformat()),
+         )
+         return [(row["day"], row["n"]) for row in rows]
++
++    def unique_visitors(self, code: str, since: datetime) -> int:
++        """Distinct daily visitor hashes; the key rotates daily, so this is the sum of
++        daily uniques over the window (a returning visitor counts once per day)."""
++        row = (
++            self.db.connection()
++            .execute(
++                "SELECT COUNT(DISTINCT visitor_hash) AS n FROM clicks"
++                " WHERE code = ? AND clicked_at >= ? AND visitor_hash IS NOT NULL",
++                (code, since.isoformat()),
++            )
++            .fetchone()
++        )
++        return row["n"]
+ 
+     def top_referrers(self, code: str, limit: int = 5) -> list[tuple[str, int]]:
+         rows = self.db.connection().execute(
+--- a/shortener/service.py
++++ b/shortener/service.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import hmac
++import secrets
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from datetime import UTC, datetime, timedelta
+@@ -43,6 +45,7 @@
+     total_clicks: int
+     daily: list[tuple[str, int]]
+     top_referrers: list[tuple[str, int]]
++    unique_visitors: int = 0
+ 
+ 
+ def utcnow() -> datetime:
+@@ -75,6 +78,7 @@
+         self.repo = repo
+         self.settings = settings
+         self.clock = clock
++        self._visitor_key = (settings.analytics_key or secrets.token_hex(32)).encode()
+         self.cache: TTLCache[Link] = TTLCache(
+             settings.redirect_cache_size, settings.redirect_cache_ttl_s
+         )
+@@ -164,11 +168,28 @@
+         self.repo.soft_delete(code, self.clock())
+         self.cache.invalidate(code)
+ 
+-    def record_click(self, code: str, referrer: str | None, user_agent: str | None) -> None:
++    def visitor_hash(self, client_ip: str | None, user_agent: str | None) -> str | None:
++        """Keyed hash of (day, IP, UA). The raw IP never leaves this function."""
++        if not client_ip:
++            return None
++        message = f"{self.clock().date().isoformat()}|{client_ip}|{user_agent or ''}"
++        return hmac.new(self._visitor_key, message.encode(), hashlib.sha256).hexdigest()[:16]
++
++    def record_click(
++        self,
++        code: str,
++        referrer: str | None,
++        user_agent: str | None,
++        client_ip: str | None = None,
++    ) -> None:
+         referrer_host = urlsplit(referrer).hostname if referrer else None
+-        self.repo.record_click(
+-            code, Click(self.clock(), referrer_host, user_agent_family(user_agent))
+-        )
++        click = Click(
++            self.clock(),
++            referrer_host,
++            user_agent_family(user_agent),
++            self.visitor_hash(client_ip, user_agent),
++        )
++        self.repo.record_click(code, click)
+ 
+     def stats(self, code: str, owner: str, days: int = 30) -> LinkStats:
+         link = self.get_owned(code, owner)
+@@ -178,4 +199,5 @@
+             total_clicks=link.click_count,
+             daily=self.repo.daily_clicks(code, since),
+             top_referrers=self.repo.top_referrers(code),
+-        )
++            unique_visitors=self.repo.unique_visitors(code, since),
++        )
+--- /dev/null
++++ b/tests/unit/test_visitors.py
+@@ -0,0 +1,57 @@
++"""Q-PRIVACY (answer: hashed): unique visitors without storing personal data."""
++
++import sqlite3
++
++
++def _create(client, auth):
++    return client.post("/api/v1/links", json={"url": "https://example.com"}, headers=auth).json()[
++        "code"
++    ]
++
++
++def test_unique_visitors_counted_per_day(client, auth, clock):
++    code = _create(client, auth)
++    alice = {"User-Agent": "Mozilla (X11)"}
++    bob = {"User-Agent": "Mozilla (iPhone)"}
++    client.get(f"/{code}", headers=alice)
++    client.get(f"/{code}", headers=alice)
++    client.get(f"/{code}", headers=bob)
++    stats = client.get(f"/api/v1/links/{code}/stats", headers=auth).json()
++    assert (stats["total_clicks"], stats["unique_visitors"]) == (3, 2)
++
++    clock.advance(86400)  # next day: the daily key rotates, so alice is new again
++    client.get(f"/{code}", headers=alice)
++    stats = client.get(f"/api/v1/links/{code}/stats", headers=auth).json()
++    assert stats["unique_visitors"] == 3
++
++
++def test_raw_ip_is_never_persisted(client, auth, settings):
++    code = _create(client, auth)
++    client.get(f"/{code}")  # TestClient connects from host "testclient"
++    conn = sqlite3.connect(settings.database_path)
++    dump = "\n".join(conn.iterdump())
++    assert "testclient" not in dump
++    hashes = [r[0] for r in conn.execute("SELECT visitor_hash FROM clicks")]
++    assert hashes and all(len(h) == 16 for h in hashes)
++
++
++def test_existing_database_is_migrated(tmp_path):
++    from shortener.db import MIGRATIONS, Database
++
++    path = str(tmp_path / "v1.db")
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT)")
++    for statement in filter(str.strip, MIGRATIONS[0][1].split(";")):
++        conn.execute(statement)
++    conn.execute("INSERT INTO schema_migrations VALUES ('0001_initial', 'x')")
++    when = "2026-01-01T00:00:00+00:00"
++    conn.execute(
++        "INSERT INTO links (code, target_url, owner, created_at) VALUES (?, ?, ?, ?)",
++        ("old", "https://o.example", "o", when),
++    )
++    conn.execute("INSERT INTO clicks (code, clicked_at) VALUES (?, ?)", ("old", when))
++    conn.commit()
++    conn.close()
++    assert Database(path).migrate() == ["0002_visitor_hash"]
++    row = sqlite3.connect(path).execute("SELECT code, visitor_hash FROM clicks").fetchone()
++    assert row == ("old", None)

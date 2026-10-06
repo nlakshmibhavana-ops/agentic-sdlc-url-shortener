@@ -1,0 +1,39 @@
+{
+  "requests": {
+    "analytics.unique_visitors@00b8c77278ed0a10": {
+      "node": "analytics.unique_visitors",
+      "subject": "00b8c77278ed0a10",
+      "summary": "Q-PRIVACY=hashed: unique visitors via daily-rotating HMAC; raw IPs never stored\nchange: Q-PRIVACY=hashed: unique visitors via daily-rotating HMAC; raw IPs never stored (digest 00b8c77278ed0a10)\nfiles: shortener/api.py, shortener/config.py, shortener/db.py, shortener/models.py, shortener/repository.py, shortener/service.py, tests/unit/test_visitors.py\nValidation evidence:\n[x] compiles: 7 files compile\n[x] lint: ruff clean\n[x] tests: ['tests', 'tests/unit/test_service.py', 'tests/unit/test_visitors.py']: 79 passed in 2.42s",
+      "reasons": [
+        "DATA-001 shortener/db.py: schema change against an existing database"
+      ],
+      "requested_at": 1791311771.6048095
+    },
+    "release@a4a9f67a307d98b2": {
+      "node": "release",
+      "subject": "a4a9f67a307d98b2",
+      "summary": "Cut the release (version, notes) after human approval\nchange: Release 1.1.0 (digest a4a9f67a307d98b2)\nfiles: RELEASE_NOTES.md, VERSION, pyproject.toml\n[x] all tests pass: 79 passed / 0 failed\n[x] coverage >= 90%: 96.9%\n[x] lint clean: 0 issues\n[x] no security findings: 0 findings\n[x] docs generated: openapi.json, docs/API.md, docs/DESIGN.md, CHANGELOG.md\n[x] no blocking questions open: []\nValidation evidence:\n[x] smoke: ok GET /readyz -> 200\nok POST /api/v1/links -> 201\nok GET /Pd35qMu -> 302\nok GET /api/v1/links/Pd35qMu/stats -> 200",
+      "reasons": [
+        "high-impact stage 'release'",
+        "CHG-002 pyproject.toml: modifies a protected file"
+      ],
+      "requested_at": 1791311782.698582
+    }
+  },
+  "decisions": {
+    "analytics.unique_visitors@00b8c77278ed0a10": {
+      "status": "approved",
+      "by": "reviewer",
+      "comment": "no raw IPs; additive migration",
+      "decided_at": 1791311771.9824035,
+      "waited_s": 0.4
+    },
+    "release@a4a9f67a307d98b2": {
+      "status": "approved",
+      "by": "reviewer",
+      "comment": "",
+      "decided_at": 1791311783.0788414,
+      "waited_s": 0.4
+    }
+  }
+}

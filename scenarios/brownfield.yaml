@@ -1,0 +1,11 @@
+id: brownfield
+title: "linkly v0.4 -> v0.5: security fix, click accuracy fix, link expiry"
+pipeline: brownfield
+playbook: linkly
+base: fixtures/linkly
+requirement: |
+  LINK-142 (security, P1): Pen test found that POST /shorten accepts javascript: and data: URLs, which become stored XSS when the short link is opened. Reject unsafe URLs with 400.
+  LINK-151 (bug): Marketing reports click counts are under-reported compared with their campaign tool, especially during launches.
+  LINK-150 (feature): Allow an optional expiry in days when creating a link; expired links must return 410 Gone.
+  Constraints: existing clients and the production database (v0.4 schema, live data) must keep working.
+budgets: {max_attempts: 40, max_active_s: 900}

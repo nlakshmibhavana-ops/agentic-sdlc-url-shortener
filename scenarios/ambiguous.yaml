@@ -1,0 +1,9 @@
+id: ambiguous
+title: "Product ask: safer links, marketing analytics, fast redirects"
+pipeline: brownfield
+playbook: shortener_v2
+base: playbook:shortener
+requirement: |
+  Make short links safer and add some analytics so marketing can see how links perform.
+  Redirects should also be fast.
+budgets: {max_attempts: 40, max_active_s: 900}

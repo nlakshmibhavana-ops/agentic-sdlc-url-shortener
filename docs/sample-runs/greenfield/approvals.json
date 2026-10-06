@@ -1,0 +1,22 @@
+{
+  "requests": {
+    "release@96eeea810db51dd1": {
+      "node": "release",
+      "subject": "96eeea810db51dd1",
+      "summary": "Cut the release (version, notes) after human approval\nchange: Release 1.0.0 (digest 96eeea810db51dd1)\nfiles: RELEASE_NOTES.md, VERSION\n[x] all tests pass: 64 passed / 0 failed\n[x] coverage >= 90%: 96.4%\n[x] lint clean: 0 issues\n[x] no security findings: 0 findings\n[x] docs generated: openapi.json, docs/API.md, docs/DESIGN.md, CHANGELOG.md, README.md\n[x] no blocking questions open: []\nValidation evidence:\n[x] smoke: ok GET /healthz -> 200\nok GET /readyz -> 200\nok POST /api/v1/links -> 201\nok GET /kmK1DCt -> 302\nok GET /api/v1/links/kmK1DCt/stats -> 200",
+      "reasons": [
+        "high-impact stage 'release'"
+      ],
+      "requested_at": 1791311745.690684
+    }
+  },
+  "decisions": {
+    "release@96eeea810db51dd1": {
+      "status": "approved",
+      "by": "reviewer",
+      "comment": "release evidence reviewed",
+      "decided_at": 1791311746.0619962,
+      "waited_s": 0.4
+    }
+  }
+}

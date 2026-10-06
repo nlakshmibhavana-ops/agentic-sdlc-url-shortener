@@ -1,0 +1,131 @@
+--- /dev/null
++++ b/tests/test_clicks.py
+@@ -0,0 +1,20 @@
++"""LINK-151: click counts were under-reported (lost updates + cached 301 redirects)."""
++
++from concurrent.futures import ThreadPoolExecutor
++
++from linkly import store
++
++
++def test_concurrent_hits_are_not_lost(db_path):
++    store.init_db(db_path)
++    code = store.create(db_path, "https://example.com")
++    with ThreadPoolExecutor(max_workers=8) as pool:
++        list(pool.map(lambda _: store.hit(db_path, code), range(200)))
++    assert store.lookup(db_path, code)["clicks"] == 200
++
++
++def test_redirect_is_not_permanently_cacheable(client):
++    code = client.post("/shorten", json={"url": "https://example.com"}).json()["code"]
++    resp = client.get(f"/r/{code}")
++    assert resp.status_code == 302
++    assert "no-store" in resp.headers["cache-control"]
+--- /dev/null
++++ b/tests/test_expiry.py
+@@ -0,0 +1,34 @@
++"""LINK-150: optional link expiry; expired links answer 410 Gone."""
++
++from datetime import UTC, datetime, timedelta
++
++from linkly import store
++
++
++def test_link_without_expiry_still_works(client):
++    code = client.post("/shorten", json={"url": "https://example.com"}).json()["code"]
++    assert client.get(f"/r/{code}").status_code == 302
++    assert client.get(f"/info/{code}").json()["expires_at"] is None
++
++
++def test_expiring_link_reports_expiry(client):
++    body = client.post("/shorten", json={"url": "https://example.com", "expires_in_days": 7}).json()
++    expires = datetime.fromisoformat(client.get(f"/info/{body['code']}").json()["expires_at"])
++    assert timedelta(days=6, hours=23) < expires - datetime.now(UTC) <= timedelta(days=7)
++
++
++def test_expired_link_is_gone(client, db_path):
++    code = client.post("/shorten", json={"url": "https://example.com", "expires_in_days": 1}).json()[
++        "code"
++    ]
++    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
++    conn = store.connect(db_path)
++    conn.execute("UPDATE urls SET expires_at = ? WHERE code = ?", (past, code))
++    conn.commit()
++    assert client.get(f"/r/{code}").status_code == 410
++
++
++def test_expiry_must_be_positive_and_bounded(client):
++    for days in (0, -1, 3651):
++        resp = client.post("/shorten", json={"url": "https://example.com", "expires_in_days": days})
++        assert resp.status_code == 422
+--- /dev/null
++++ b/tests/test_migration.py
+@@ -0,0 +1,28 @@
++"""Existing production databases (created by v0.4.x) must upgrade in place without data loss."""
++
++import sqlite3
++
++from linkly import store
++
++V04_SCHEMA = (
++    "CREATE TABLE urls (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE,"
++    " url TEXT NOT NULL, clicks INTEGER NOT NULL DEFAULT 0,"
++    " created TEXT DEFAULT CURRENT_TIMESTAMP)"
++)
++
++
++def test_upgrade_existing_database(tmp_path):
++    path = str(tmp_path / "prod-v04.db")
++    conn = sqlite3.connect(path)
++    conn.execute(V04_SCHEMA)
++    conn.execute("INSERT INTO urls (code, url, clicks) VALUES ('1', 'https://old.example', 41)")
++    conn.commit()
++    conn.close()
++
++    store.init_db(path)
++    store.init_db(path)  # idempotent
++
++    row = store.lookup(path, "1")
++    assert row["url"] == "https://old.example"
++    assert row["clicks"] == 41
++    assert row["expires_at"] is None
+--- /dev/null
++++ b/tests/test_validation.py
+@@ -0,0 +1,37 @@
++"""LINK-142: unsafe target URLs must be rejected with 400 and never stored."""
++
++import pytest
++
++from linkly.validation import InvalidURL, validate_url
++
++
++@pytest.mark.parametrize(
++    "url",
++    [
++        "javascript:alert(1)",
++        "JAVASCRIPT:alert(1)",
++        "data:text/html;base64,PHNjcmlwdD4=",
++        "vbscript:msgbox(1)",
++        "file:///etc/passwd",
++        "//evil.example/path",
++        "https://",
++        "https://user:pw@bank.example/",
++        "https://example.com/a b",
++        "",
++    ],
++)
++def test_unsafe_urls_rejected(url):
++    with pytest.raises(InvalidURL):
++        validate_url(url)
++
++
++def test_valid_urls_unchanged():
++    assert validate_url("https://Example.com/Path?q=1") == "https://Example.com/Path?q=1"
++
++
++def test_api_rejects_script_url_and_stores_nothing(client):
++    resp = client.post("/shorten", json={"url": "javascript:alert(document.cookie)"})
++    assert resp.status_code == 400
++    # Codes are sequential in this legacy service: nothing must have been inserted.
++    ok = client.post("/shorten", json={"url": "https://example.com"}).json()["code"]
++    assert ok == "1"

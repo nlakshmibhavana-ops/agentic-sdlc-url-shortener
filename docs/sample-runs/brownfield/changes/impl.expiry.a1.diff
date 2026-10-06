@@ -1,0 +1,83 @@
+--- a/linkly/main.py
++++ b/linkly/main.py
+@@ -1,10 +1,11 @@
+ """linkly HTTP API."""
+ 
+ import os
++from datetime import UTC, datetime, timedelta
+ 
+ from fastapi import FastAPI, HTTPException
+ from fastapi.responses import RedirectResponse
+-from pydantic import BaseModel
++from pydantic import BaseModel, Field
+ 
+ from . import store
+ from .validation import InvalidURL, validate_url
+@@ -14,6 +15,7 @@
+ 
+ class ShortenIn(BaseModel):
+     url: str
++    expires_in_days: int | None = Field(None, ge=1, le=3650)
+ 
+ 
+ def create_app(db_path=None):
+@@ -27,7 +29,12 @@
+             url = validate_url(body.url)
+         except InvalidURL as exc:
+             raise HTTPException(400, str(exc)) from exc
+-        code = store.create(db, url)
++        expires_at = None
++        if body.expires_in_days is not None:
++            expires_at = (
++                datetime.now(UTC) + timedelta(days=body.expires_in_days)
++            ).isoformat()
++        code = store.create(db, url, expires_at)
+         return {"code": code, "short": f"/r/{code}"}
+ 
+     @app.get("/r/{code}")
+@@ -35,6 +42,8 @@
+         row = store.lookup(db, code)
+         if not row:
+             raise HTTPException(404, "not found")
++        if row["expires_at"] and datetime.fromisoformat(row["expires_at"]) <= datetime.now(UTC):
++            raise HTTPException(410, "link expired")
+         store.hit(db, code)
+         # 302 + no-store: a cached 301 never reaches us again, so clicks went uncounted.
+         return RedirectResponse(
+@@ -46,6 +55,11 @@
+         row = store.lookup(db, code)
+         if not row:
+             raise HTTPException(404, "not found")
+-        return {"code": code, "url": row["url"], "clicks": row["clicks"]}
++        return {
++            "code": code,
++            "url": row["url"],
++            "clicks": row["clicks"],
++            "expires_at": row["expires_at"],
++        }
+ 
+     return app
+--- a/linkly/store.py
++++ b/linkly/store.py
+@@ -26,6 +26,7 @@
+         " code TEXT UNIQUE,"
+         " url TEXT NOT NULL,"
+         " clicks INTEGER NOT NULL DEFAULT 0,"
++    " expires_at TEXT,"
+         " created TEXT DEFAULT CURRENT_TIMESTAMP)"
+     )
+     conn.commit()
+@@ -39,9 +40,11 @@
+     return out or "0"
+ 
+ 
+-def create(path, url):
++def create(path, url, expires_at=None):
+     conn = connect(path)
+-    cur = conn.execute("INSERT INTO urls (url) VALUES (?)", (url,))
++    cur = conn.execute(
++        "INSERT INTO urls (url, expires_at) VALUES (?, ?)", (url, expires_at)
++    )
+     code = encode(cur.lastrowid)
+     conn.execute("UPDATE urls SET code = ? WHERE id = ?", (code, cur.lastrowid))
+     conn.commit()

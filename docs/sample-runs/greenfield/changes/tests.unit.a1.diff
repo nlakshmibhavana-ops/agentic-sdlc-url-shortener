@@ -1,0 +1,289 @@
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,62 @@
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++
++import pytest
++
++API_KEY = "test-key-1"
++OTHER_KEY = "test-key-2"
++
++
++class FakeClock:
++    def __init__(self) -> None:
++        self.now = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
++        self.mono = 1000.0
++
++    def __call__(self) -> datetime:
++        return self.now
++
++    def monotonic(self) -> float:
++        return self.mono
++
++    def advance(self, seconds: float) -> None:
++        self.now += timedelta(seconds=seconds)
++        self.mono += seconds
++
++
++@pytest.fixture
++def clock() -> FakeClock:
++    return FakeClock()
++
++
++@pytest.fixture
++def settings(tmp_path):
++    from shortener.config import Settings
++
++    return Settings(
++        database_path=str(tmp_path / "test.db"),
++        base_url="http://sho.rt",
++        api_keys=(API_KEY, OTHER_KEY),
++        rate_limit_per_minute=5,
++    )
++
++
++@pytest.fixture
++def client(settings, clock):
++    # Imported lazily so module-level unit tests can run before the API layer exists.
++    from fastapi.testclient import TestClient
++
++    from shortener.api import create_app
++
++    app = create_app(settings, clock=clock, limiter_clock=clock.monotonic)
++    return TestClient(app, follow_redirects=False)
++
++
++@pytest.fixture
++def auth() -> dict[str, str]:
++    return {"X-API-Key": API_KEY}
++
++
++@pytest.fixture
++def other_auth() -> dict[str, str]:
++    return {"X-API-Key": OTHER_KEY}
+--- /dev/null
++++ b/tests/unit/test_codes.py
+@@ -0,0 +1,26 @@
++import pytest
++
++from shortener.codes import ALPHABET, InvalidAlias, generate_code, validate_alias
++
++
++def test_generated_codes_use_base62_and_requested_length():
++    code = generate_code(9)
++    assert len(code) == 9
++    assert set(code) <= set(ALPHABET)
++
++
++def test_generated_codes_are_not_sequential():
++    assert len({generate_code() for _ in range(500)}) == 500
++
++
++@pytest.mark.parametrize("alias", ["abc", "spring-sale", "Q4_promo", "a" * 32])
++def test_valid_aliases(alias):
++    assert validate_alias(alias) == alias
++
++
++@pytest.mark.parametrize(
++    "alias", ["ab", "a" * 33, "has space", "emoji🙂", "../etc", "API", "healthz"]
++)
++def test_invalid_or_reserved_aliases(alias):
++    with pytest.raises(InvalidAlias):
++        validate_alias(alias)
+--- /dev/null
++++ b/tests/unit/test_ratelimit.py
+@@ -0,0 +1,33 @@
++from shortener.ratelimit import RateLimiter
++
++
++class Clock:
++    def __init__(self):
++        self.t = 0.0
++
++    def __call__(self):
++        return self.t
++
++
++def test_allows_burst_then_limits_and_refills():
++    clock = Clock()
++    limiter = RateLimiter(60, burst=3, clock=clock)
++    assert [limiter.acquire("k") for _ in range(3)] == [0.0, 0.0, 0.0]
++    wait = limiter.acquire("k")
++    assert 0 < wait <= 1.0
++    clock.t += 1.0
++    assert limiter.acquire("k") == 0.0
++
++
++def test_keys_are_isolated():
++    limiter = RateLimiter(60, burst=1, clock=Clock())
++    assert limiter.acquire("a") == 0.0
++    assert limiter.acquire("a") > 0
++    assert limiter.acquire("b") == 0.0
++
++
++def test_memory_is_bounded():
++    limiter = RateLimiter(60, clock=Clock(), max_keys=10)
++    for i in range(100):
++        limiter.acquire(f"k{i}")
++    assert len(limiter._buckets) == 10
+--- /dev/null
++++ b/tests/unit/test_service.py
+@@ -0,0 +1,100 @@
++from datetime import timedelta
++
++import pytest
++
++from shortener.config import Settings
++from shortener.db import Database
++from shortener.repository import LinkRepository
++from shortener.service import (
++    AliasTaken,
++    IdempotencyConflict,
++    InvalidExpiry,
++    LinkGone,
++    LinkNotFound,
++    LinkService,
++    user_agent_family,
++)
++
++
++@pytest.fixture
++def service(tmp_path, clock):
++    db = Database(str(tmp_path / "svc.db"))
++    db.migrate()
++    return LinkService(LinkRepository(db), Settings(base_url="http://sho.rt"), clock)
++
++
++def test_migrations_are_idempotent(tmp_path):
++    from shortener.db import MIGRATIONS
++
++    db = Database(str(tmp_path / "m.db"))
++    assert db.migrate() == [name for name, _ in MIGRATIONS]
++    assert db.migrate() == []
++
++
++def test_create_and_resolve(service):
++    link, created = service.create("https://example.com", "owner")
++    assert created
++    assert service.resolve(link.code).target_url == "https://example.com"
++
++
++def test_alias_conflict(service):
++    service.create("https://example.com", "owner", alias="promo")
++    with pytest.raises(AliasTaken):
++        service.create("https://example.org", "other", alias="promo")
++
++
++def test_retries_code_collisions(service, monkeypatch):
++    codes = iter(["AAAAAAA", "AAAAAAA", "BBBBBBB"])
++    monkeypatch.setattr("shortener.service.generate_code", lambda n: next(codes))
++    first, _ = service.create("https://example.com/1", "owner")
++    second, _ = service.create("https://example.com/2", "owner")
++    assert (first.code, second.code) == ("AAAAAAA", "BBBBBBB")
++
++
++def test_expiry_must_be_future_and_is_enforced(service, clock):
++    with pytest.raises(InvalidExpiry):
++        service.create("https://example.com", "owner", expires_at=clock.now)
++    link, _ = service.create(
++        "https://example.com", "owner", expires_at=clock.now + timedelta(hours=1)
++    )
++    clock.advance(3601)
++    with pytest.raises(LinkGone):
++        service.resolve(link.code)
++
++
++def test_idempotency_replay_and_conflict(service):
++    a, created_a = service.create("https://example.com", "owner", idempotency_key="k1")
++    b, created_b = service.create("https://example.com", "owner", idempotency_key="k1")
++    assert (a.code, created_a, created_b) == (b.code, True, False)
++    with pytest.raises(IdempotencyConflict):
++        service.create("https://example.org", "owner", idempotency_key="k1")
++
++
++def test_owner_isolation(service):
++    link, _ = service.create("https://example.com", "owner")
++    with pytest.raises(LinkNotFound):
++        service.get_owned(link.code, "intruder")
++    with pytest.raises(LinkNotFound):
++        service.delete(link.code, "intruder")
++
++
++def test_click_counting_is_atomic_under_concurrency(service):
++    from concurrent.futures import ThreadPoolExecutor
++
++    link, _ = service.create("https://example.com", "owner")
++    with ThreadPoolExecutor(max_workers=8) as pool:
++        list(pool.map(lambda _: service.record_click(link.code, None, "x"), range(80)))
++    assert service.stats(link.code, "owner").total_clicks == 80
++
++
++@pytest.mark.parametrize(
++    "ua,family",
++    [
++        (None, "unknown"),
++        ("Googlebot/2.1", "bot"),
++        ("Mozilla (iPhone)", "mobile"),
++        ("Mozilla (X11)", "desktop"),
++    ],
++)
++def test_user_agent_family(ua, family):
++    assert user_agent_family(ua) == family
+--- /dev/null
++++ b/tests/unit/test_validation.py
+@@ -0,0 +1,53 @@
++import pytest
++
++from shortener.validation import InvalidURL, validate_target_url
++
++
++def check(url, **kw):
++    return validate_target_url(url, max_length=2048, base_url="http://sho.rt", **kw)
++
++
++def test_normalises_scheme_and_host_but_keeps_path_case():
++    assert check("HTTPS://Example.COM/Path?q=A#Frag") == "https://example.com/Path?q=A#Frag"
++
++
++@pytest.mark.parametrize(
++    "url",
++    [
++        "javascript:alert(1)",
++        "data:text/html,<script>alert(1)</script>",
++        "ftp://example.com/file",
++        "file:///etc/passwd",
++        "https://",
++        "https://user:pass@example.com/",
++        "https://paypal.com@evil.example/",
++        "http://localhost:8080/admin",
++        "http://127.0.0.1/",
++        "http://10.0.0.5/",
++        "http://192.168.1.1/",
++        "http://169.254.169.254/latest/meta-data/",
++        "http://[::1]/",
++        "http://db.internal/",
++        "http://sho.rt/abc",
++        "https://example.com/has space",
++        "https://example.com/\nheader",
++        "",
++    ],
++)
++def test_rejects_unsafe_urls(url):
++    with pytest.raises(InvalidURL):
++        check(url)
++
++
++def test_rejects_overlong_urls():
++    with pytest.raises(InvalidURL):
++        validate_target_url("https://e.com/" + "a" * 50, max_length=40, base_url="http://sho.rt")
++
++
++def test_private_hosts_allowed_when_configured():
++    assert check("http://10.0.0.5/x", allow_private=True) == "http://10.0.0.5/x"
++
++
++def test_keeps_explicit_port_and_ipv6():
++    assert check("https://example.com:8443/a") == "https://example.com:8443/a"
++    assert check("http://[2606:4700::1111]/") == "http://[2606:4700::1111]/"

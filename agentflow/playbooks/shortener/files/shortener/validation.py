@@ -1,0 +1,60 @@
+"""Target-URL validation. The service never fetches targets; these rules stop abuse of the
+redirect itself (script URLs, credential-spoofing, internal hosts, redirect loops)."""
+
+from __future__ import annotations
+
+import ipaddress
+from urllib.parse import urlsplit, urlunsplit
+
+ALLOWED_SCHEMES = frozenset({"http", "https"})
+_INTERNAL_SUFFIXES = (".localhost", ".local", ".internal")
+
+
+class InvalidURL(ValueError):
+    pass
+
+
+def _is_private_host(host: str) -> bool:
+    if host == "localhost" or host.endswith(_INTERNAL_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return not ip.is_global
+
+
+def validate_target_url(
+    url: str, *, max_length: int, base_url: str, allow_private: bool = False
+) -> str:
+    """Return the normalised URL or raise InvalidURL."""
+    url = url.strip()
+    if not url:
+        raise InvalidURL("url is required")
+    if len(url) > max_length:
+        raise InvalidURL(f"url exceeds {max_length} characters")
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        raise InvalidURL("url contains whitespace or control characters")
+
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
+        raise InvalidURL("only http and https URLs can be shortened")
+    if parts.username is not None or parts.password is not None:
+        raise InvalidURL("URLs with embedded credentials are not allowed")
+    host = (parts.hostname or "").lower()
+    if not host:
+        raise InvalidURL("url must include a host")
+    try:
+        host.encode("idna")
+    except UnicodeError as exc:
+        raise InvalidURL("url host is not a valid domain name") from exc
+    if not allow_private and _is_private_host(host):
+        raise InvalidURL("private, loopback and internal hosts are not allowed")
+    if host == (urlsplit(base_url).hostname or "").lower():
+        raise InvalidURL("cannot shorten a link to this service")
+
+    netloc = host if parts.port is None else f"{host}:{parts.port}"
+    if ":" in host:  # IPv6 literal
+        netloc = f"[{host}]" if parts.port is None else f"[{host}]:{parts.port}"
+    return urlunsplit((scheme, netloc, parts.path, parts.query, parts.fragment))

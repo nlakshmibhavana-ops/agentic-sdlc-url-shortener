@@ -1,0 +1,116 @@
+from datetime import timedelta
+
+
+def create(client, auth, **body):
+    body.setdefault("url", "https://example.com/landing")
+    return client.post("/api/v1/links", json=body, headers=auth)
+
+
+def test_create_redirect_and_stats_flow(client, auth):
+    resp = create(client, auth)
+    assert resp.status_code == 201
+    link = resp.json()
+    assert link["short_url"] == f"http://sho.rt/{link['code']}"
+
+    redirect = client.get(f"/{link['code']}", headers={"Referer": "https://news.example/item"})
+    assert redirect.status_code == 302
+    assert redirect.headers["location"] == "https://example.com/landing"
+    assert redirect.headers["cache-control"] == "private, no-store"
+    client.get(f"/{link['code']}")
+
+    stats = client.get(f"/api/v1/links/{link['code']}/stats", headers=auth).json()
+    assert stats["total_clicks"] == 2
+    assert stats["daily"] == [{"date": "2026-01-15", "clicks": 2}]
+    assert {"host": "news.example", "clicks": 1} in stats["top_referrers"]
+    assert {"host": "direct", "clicks": 1} in stats["top_referrers"]
+
+
+def test_custom_alias_and_conflict(client, auth, other_auth):
+    assert create(client, auth, alias="spring-sale").json()["code"] == "spring-sale"
+    resp = create(client, other_auth, alias="spring-sale")
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "alias_taken"
+
+
+def test_rejects_unsafe_target(client, auth):
+    resp = create(client, auth, url="javascript:alert(document.cookie)")
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_url"
+
+
+def test_rejects_unknown_fields(client, auth):
+    assert create(client, auth, owner="someone-else").status_code == 422
+
+
+def test_management_requires_api_key(client):
+    assert client.post("/api/v1/links", json={"url": "https://example.com"}).status_code == 401
+    bad = {"X-API-Key": "wrong"}
+    assert (
+        client.post("/api/v1/links", json={"url": "https://e.com"}, headers=bad).status_code == 401
+    )
+
+
+def test_links_are_private_to_their_owner(client, auth, other_auth):
+    code = create(client, auth).json()["code"]
+    assert client.get(f"/api/v1/links/{code}", headers=other_auth).status_code == 404
+    assert client.get(f"/api/v1/links/{code}/stats", headers=other_auth).status_code == 404
+    assert client.delete(f"/api/v1/links/{code}", headers=other_auth).status_code == 404
+
+
+def test_delete_makes_link_gone(client, auth):
+    code = create(client, auth).json()["code"]
+    assert client.delete(f"/api/v1/links/{code}", headers=auth).status_code == 204
+    assert client.get(f"/{code}").status_code == 410
+
+
+def test_expired_link_returns_gone(client, auth, clock):
+    expires = (clock.now + timedelta(minutes=5)).isoformat()
+    code = create(client, auth, expires_at=expires).json()["code"]
+    assert client.get(f"/{code}").status_code == 302
+    clock.advance(301)
+    assert client.get(f"/{code}").status_code == 410
+
+
+def test_unknown_code_is_404(client):
+    resp = client.get("/doesNotExist")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_idempotency_key_replays_original(client, auth):
+    headers = {**auth, "Idempotency-Key": "order-42"}
+    first = client.post("/api/v1/links", json={"url": "https://example.com"}, headers=headers)
+    again = client.post("/api/v1/links", json={"url": "https://example.com"}, headers=headers)
+    assert (first.status_code, again.status_code) == (201, 200)
+    assert first.json()["code"] == again.json()["code"]
+    clash = client.post("/api/v1/links", json={"url": "https://example.org"}, headers=headers)
+    assert clash.status_code == 422
+
+
+def test_rate_limit_returns_429_with_retry_after(client, auth, clock):
+    for _ in range(5):
+        assert create(client, auth).status_code == 201
+    limited = create(client, auth)
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+    clock.advance(12)
+    assert create(client, auth).status_code == 201
+
+
+def test_health_and_readiness(client):
+    assert client.get("/healthz").json() == {"status": "ok"}
+    assert client.get("/readyz").status_code == 200
+
+
+def test_request_id_is_propagated(client):
+    assert (
+        client.get("/healthz", headers={"X-Request-ID": "abc123"}).headers["x-request-id"]
+        == "abc123"
+    )
+    assert client.get("/healthz").headers["x-request-id"]
+
+
+def test_home_page_is_served(client):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "URL Shortener" in resp.text and "/api/v1/links" in resp.text

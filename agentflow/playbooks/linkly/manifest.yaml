@@ -1,0 +1,191 @@
+# Change catalogue for the legacy "linkly" service (brownfield scenario).
+# Each task is one reviewable change set. Edit ops are exact find/replace anchors, so a
+# task that edits a file another task also edits must run after it; the planner enforces
+# this by serialising tasks with overlapping write sets.
+name: linkly
+package: linkly
+coverage_min: 85
+docs:
+  openapi_factory: linkly.main:create_app
+  env: {LINKLY_DB: ":memory:"}
+serve_env: {LINKLY_DB: "{run_dir}/service.db"}
+smoke_env: {LINKLY_DB: "{run_dir}/smoke.db"}
+smoke:
+  - {method: POST, path: /shorten, json: {url: "https://example.com", expires_in_days: 30}, expect: 200, save: code}
+  - {method: GET, path: "/r/{code}", expect: 302}
+  - {method: POST, path: /shorten, json: {url: "javascript:alert(1)"}, expect: 400}
+  - {method: GET, path: "/info/{code}", expect: 200}
+tasks:
+  - id: tests.regression
+    title: Author regression tests for LINK-142/150/151 before touching code (test-first)
+    capabilities: [url_safety, expiry, click_accuracy]
+    agent: test_author
+    writes: [tests/test_validation.py, tests/test_clicks.py, tests/test_expiry.py, tests/test_migration.py]
+    ops:
+      - {op: write, path: tests/test_validation.py, src: files/tests/test_validation.py}
+      - {op: write, path: tests/test_clicks.py, src: files/tests/test_clicks.py}
+      - {op: write, path: tests/test_expiry.py, src: files/tests/test_expiry.py}
+      - {op: write, path: tests/test_migration.py, src: files/tests/test_migration.py}
+
+  - id: impl.url_validation
+    title: "LINK-142: reject script/data/credential URLs at the API boundary (extract validation module)"
+    capabilities: [url_safety]
+    deps: [tests.regression]
+    writes: [linkly/validation.py, linkly/main.py]
+    verify: [tests/test_validation.py, tests/test_api.py]
+    ops:
+      - {op: write, path: linkly/validation.py, src: files/linkly/validation.py}
+      - op: edit
+        path: linkly/main.py
+        old: |2
+          from . import store
+        new: |2
+          from . import store
+          from .validation import InvalidURL, validate_url
+      - op: edit
+        path: linkly/main.py
+        old: |2
+              def shorten(body: ShortenIn):
+                  code = store.create(db, body.url)
+        new: |2
+              def shorten(body: ShortenIn):
+                  try:
+                      url = validate_url(body.url)
+                  except InvalidURL as exc:
+                      raise HTTPException(400, str(exc)) from exc
+                  code = store.create(db, url)
+
+  - id: impl.click_accuracy
+    title: "LINK-151: atomic click increment; 302 + no-store so browsers stop caching redirects"
+    capabilities: [click_accuracy]
+    deps: [tests.regression]
+    writes: [linkly/store.py, linkly/main.py]
+    verify: [tests/test_clicks.py, tests/test_api.py]
+    ops:
+      - op: edit
+        path: linkly/store.py
+        old: |2
+          def hit(path, code):
+              conn = connect(path)
+              row = conn.execute("SELECT clicks FROM urls WHERE code = ?", (code,)).fetchone()
+              conn.execute("UPDATE urls SET clicks = ? WHERE code = ?", (row["clicks"] + 1, code))
+              conn.commit()
+        new: |2
+          def hit(path, code):
+              # Single atomic statement: the old read-modify-write lost updates under load.
+              conn = connect(path)
+              conn.execute("UPDATE urls SET clicks = clicks + 1 WHERE code = ?", (code,))
+              conn.commit()
+      - op: edit
+        path: linkly/store.py
+        old: |2
+                  conn = sqlite3.connect(path)
+        new: |2
+                  conn = sqlite3.connect(path, timeout=10.0)
+      - op: edit
+        path: linkly/main.py
+        old: |2
+                  return RedirectResponse(row["url"], status_code=301)
+        new: |2
+                  # 302 + no-store: a cached 301 never reaches us again, so clicks went uncounted.
+                  return RedirectResponse(
+                      row["url"], status_code=302, headers={"Cache-Control": "private, no-store"}
+                  )
+
+  - id: impl.expiry
+    title: "LINK-150: optional expires_in_days; 410 Gone after expiry; in-place schema migration"
+    capabilities: [expiry]
+    deps: [tests.regression, impl.url_validation, impl.click_accuracy]
+    writes: [linkly/store.py, linkly/main.py]
+    verify: [tests/test_expiry.py, tests/test_migration.py, tests/test_api.py]
+    # Candidates are tried in order. The first is the kind of change an agent often
+    # produces first: correct for fresh databases, silently broken for existing ones.
+    candidates:
+      - summary: Add expires_at to the CREATE TABLE statement
+        ops: &expiry_common_ops
+          - op: edit
+            path: linkly/store.py
+            old: |2
+                  " clicks INTEGER NOT NULL DEFAULT 0,"
+            new: |2
+                  " clicks INTEGER NOT NULL DEFAULT 0,"
+                  " expires_at TEXT,"
+          - op: edit
+            path: linkly/store.py
+            old: |2
+              def create(path, url):
+                  conn = connect(path)
+                  cur = conn.execute("INSERT INTO urls (url) VALUES (?)", (url,))
+            new: |2
+              def create(path, url, expires_at=None):
+                  conn = connect(path)
+                  cur = conn.execute(
+                      "INSERT INTO urls (url, expires_at) VALUES (?, ?)", (url, expires_at)
+                  )
+          - op: edit
+            path: linkly/main.py
+            old: |2
+              import os
+            new: |2
+              import os
+              from datetime import UTC, datetime, timedelta
+          - op: edit
+            path: linkly/main.py
+            old: |2
+              from pydantic import BaseModel
+            new: |2
+              from pydantic import BaseModel, Field
+          - op: edit
+            path: linkly/main.py
+            old: |2
+                  url: str
+            new: |2
+                  url: str
+                  expires_in_days: int | None = Field(None, ge=1, le=3650)
+          - op: edit
+            path: linkly/main.py
+            old: |2
+                      code = store.create(db, url)
+            new: |2
+                      expires_at = None
+                      if body.expires_in_days is not None:
+                          expires_at = (
+                              datetime.now(UTC) + timedelta(days=body.expires_in_days)
+                          ).isoformat()
+                      code = store.create(db, url, expires_at)
+          - op: edit
+            path: linkly/main.py
+            old: |2
+                      store.hit(db, code)
+            new: |2
+                      if row["expires_at"] and datetime.fromisoformat(row["expires_at"]) <= datetime.now(UTC):
+                          raise HTTPException(410, "link expired")
+                      store.hit(db, code)
+          - op: edit
+            path: linkly/main.py
+            old: |2
+                      return {"code": code, "url": row["url"], "clicks": row["clicks"]}
+            new: |2
+                      return {
+                          "code": code,
+                          "url": row["url"],
+                          "clicks": row["clicks"],
+                          "expires_at": row["expires_at"],
+                      }
+      - summary: Same change plus an idempotent ALTER TABLE migration for existing databases
+        ops:
+          - *expiry_common_ops
+          - op: edit
+            path: linkly/store.py
+            old: |2
+                      " created TEXT DEFAULT CURRENT_TIMESTAMP)"
+                  )
+                  conn.commit()
+            new: |2
+                      " created TEXT DEFAULT CURRENT_TIMESTAMP)"
+                  )
+                  columns = {row["name"] for row in conn.execute("PRAGMA table_info(urls)")}
+                  if "expires_at" not in columns:
+                      # v0.5 migration: additive and nullable, so v0.4 rows keep working unchanged.
+                      conn.execute("ALTER TABLE urls ADD COLUMN expires_at TEXT")
+                  conn.commit()

@@ -1,0 +1,110 @@
+# Change catalogue for the greenfield URL shortener.
+# Tests are authored first (from the acceptance criteria) and each implementation task
+# is verified against the tests for the module it delivers.
+name: shortener
+package: shortener
+coverage_min: 90
+docs:
+  openapi_factory: shortener.api:create_app
+  env: {SHORTENER_DB: ":memory:"}
+  readme: files/README.md
+tasks:
+  - id: scaffold
+    title: Project scaffold, configuration and entry point
+    capabilities: [platform]
+    writes: [pyproject.toml, shortener/__init__.py, shortener/config.py, shortener/__main__.py]
+    ops:
+      - {op: write, path: pyproject.toml, src: files/pyproject.toml}
+      - {op: write, path: shortener/__init__.py, src: files/shortener/__init__.py}
+      - {op: write, path: shortener/config.py, src: files/shortener/config.py}
+      - {op: write, path: shortener/__main__.py, src: files/shortener/__main__.py}
+
+  - id: tests.unit
+    title: Unit tests from acceptance criteria (codes, validation, rate limit, service)
+    capabilities: [link_creation, custom_alias, url_safety, rate_limiting, analytics, expiry]
+    agent: test_author
+    writes: [tests/__init__.py, tests/conftest.py, tests/unit/__init__.py, tests/unit/test_codes.py,
+             tests/unit/test_validation.py, tests/unit/test_ratelimit.py, tests/unit/test_service.py]
+    ops:
+      - {op: write, path: tests/__init__.py, src: files/tests/__init__.py}
+      - {op: write, path: tests/conftest.py, src: files/tests/conftest.py}
+      - {op: write, path: tests/unit/__init__.py, src: files/tests/unit/__init__.py}
+      - {op: write, path: tests/unit/test_codes.py, src: files/tests/unit/test_codes.py}
+      - {op: write, path: tests/unit/test_validation.py, src: files/tests/unit/test_validation.py}
+      - {op: write, path: tests/unit/test_ratelimit.py, src: files/tests/unit/test_ratelimit.py}
+      - {op: write, path: tests/unit/test_service.py, src: files/tests/unit/test_service.py}
+
+  - id: tests.integration
+    title: API contract tests (status codes, auth, ownership, idempotency, rate limit)
+    capabilities: [link_creation, redirect, analytics, rate_limiting, reliability]
+    agent: test_author
+    deps: [tests.unit]
+    writes: [tests/integration/__init__.py, tests/integration/test_api.py]
+    ops:
+      - {op: write, path: tests/integration/__init__.py, src: files/tests/integration/__init__.py}
+      - {op: write, path: tests/integration/test_api.py, src: files/tests/integration/test_api.py}
+
+  - id: impl.codes
+    title: Random base62 code generator and custom-alias rules
+    capabilities: [link_creation, custom_alias]
+    deps: [scaffold, tests.unit]
+    writes: [shortener/codes.py]
+    verify: [tests/unit/test_codes.py]
+    ops:
+      - {op: write, path: shortener/codes.py, src: files/shortener/codes.py}
+
+  - id: impl.validation
+    title: Target-URL validation (scheme allowlist, credentials, private hosts, loops)
+    capabilities: [url_safety]
+    deps: [scaffold, tests.unit]
+    writes: [shortener/validation.py]
+    verify: [tests/unit/test_validation.py]
+    ops:
+      - {op: write, path: shortener/validation.py, src: files/shortener/validation.py}
+
+  - id: impl.ratelimit
+    title: Token-bucket rate limiter with bounded memory
+    capabilities: [rate_limiting]
+    deps: [scaffold, tests.unit]
+    writes: [shortener/ratelimit.py]
+    verify: [tests/unit/test_ratelimit.py]
+    ops:
+      - {op: write, path: shortener/ratelimit.py, src: files/shortener/ratelimit.py}
+
+  - id: impl.storage
+    title: SQLite schema, migrations and link/click repository
+    capabilities: [link_creation, analytics, expiry]
+    deps: [scaffold]
+    writes: [shortener/db.py, shortener/repository.py]
+    ops:
+      - {op: write, path: shortener/db.py, src: files/shortener/db.py}
+      - {op: write, path: shortener/repository.py, src: files/shortener/repository.py}
+
+  - id: impl.service
+    title: Link service (create/resolve/delete/stats, idempotency, expiry, ownership)
+    capabilities: [link_creation, custom_alias, expiry, analytics, reliability]
+    deps: [impl.storage, impl.codes, impl.validation, tests.unit]
+    writes: [shortener/service.py]
+    verify: [tests/unit/test_service.py]
+    ops:
+      - {op: write, path: shortener/service.py, src: files/shortener/service.py}
+
+  - id: impl.api
+    title: HTTP API, auth, error mapping, request IDs, health/readiness
+    capabilities: [link_creation, redirect, analytics, reliability]
+    deps: [impl.service, impl.ratelimit, tests.integration]
+    writes: [shortener/models.py, shortener/api.py, shortener/web.py]
+    verify: [tests]
+    ops:
+      - {op: write, path: shortener/models.py, src: files/shortener/models.py}
+      - {op: write, path: shortener/api.py, src: files/shortener/api.py}
+      - {op: write, path: shortener/web.py, src: files/shortener/web.py}
+
+serve_env: {SHORTENER_DB: "{run_dir}/service.db", SHORTENER_API_KEYS: dev-key}
+smoke_env: {SHORTENER_DB: "{run_dir}/smoke.db", SHORTENER_API_KEYS: smoke-key}
+smoke:
+  - {method: GET, path: /healthz, expect: 200}
+  - {method: GET, path: /readyz, expect: 200}
+  - {method: POST, path: /api/v1/links, json: {url: "https://example.com/smoke"}, headers: {X-API-Key: smoke-key}, expect: 201, save: code}
+  - {method: GET, path: "/{code}", expect: 302}
+  - {method: GET, path: "/api/v1/links/{code}/stats", headers: {X-API-Key: smoke-key}, expect: 200}

@@ -1,0 +1,967 @@
+--- /dev/null
++++ b/CHANGELOG.md
+@@ -0,0 +1,7 @@
++# Changelog
++
++## [Unreleased] - Product ask: safer links, marketing analytics, fast redirects
++
++- Q-PERF: bounded TTL read-through cache on the redirect path (p95 < 50 ms)
++- Q-SAFETY: configurable domain denylist (incl. subdomains)
++- Q-PRIVACY=hashed: unique visitors via daily-rotating HMAC; raw IPs never stored
+--- /dev/null
++++ b/docs/API.md
+@@ -0,0 +1,13 @@
++# URL Shortener API (v1.0.0)
++
++Generated from the application's OpenAPI schema (`openapi.json`).
++
++| Method | Path | Summary | Responses |
++|---|---|---|---|
++| POST | `/api/v1/links` | Create Link | 201, 400, 401, 404, 409, 410, 422, 429 |
++| DELETE | `/api/v1/links/{code}` | Delete Link | 204, 400, 401, 404, 409, 410, 422, 429 |
++| GET | `/api/v1/links/{code}` | Get Link | 200, 400, 401, 404, 409, 410, 422, 429 |
++| GET | `/api/v1/links/{code}/stats` | Link Stats | 200, 400, 401, 404, 409, 410, 422, 429 |
++| GET | `/healthz` | Healthz | 200 |
++| GET | `/readyz` | Readyz | 200 |
++| GET | `/{code}` | Follow | 302, 400, 401, 404, 409, 410, 422, 429 |
+--- /dev/null
++++ b/docs/DESIGN.md
+@@ -0,0 +1,56 @@
++# Design record
++
++Architecture: modular monolith: api -> service -> repository -> db, pure helpers below
++
++## Capabilities
++
++- **analytics**: Per-link total clicks, daily breakdown and top referrer hosts; Click recording never delays the redirect response
++- **domain_denylist**: Targets on a configurable domain denylist (incl. subdomains) are rejected with 400
++- **performance**: Redirect path meets the agreed latency target
++- **redirect**: GET /{code} returns 302 to the target; Unknown codes return 404; deleted or expired codes return 410
++- **redirect_cache**: Hot redirects are served from a bounded in-process TTL cache; Deleting a link invalidates its cache entry immediately; Redirect p95 < 50 ms in-process (perf smoke test)
++- **unique_visitors**: Stats report unique visitors per link; No raw IP address is ever persisted: visitors are a keyed, daily-rotating hash
++- **url_safety**: Only http(s) targets are accepted; script/data/file schemes are rejected with 400; URLs with embedded credentials are rejected
++
++## Decisions (ADRs)
++
++### ADR-01: Record clicks after the response; store referrer host + UA family only
++
++Keeps redirect latency independent of analytics writes and minimises personal data.
++
++Alternatives considered: Synchronous write (simpler, slower); Event queue (scales, more infrastructure)
++
++### ADR-02: Configurable domain denylist, matched on registrable suffix
++
++Cheap, deterministic, auditable; reputation APIs add a vendor dependency.
++
++Alternatives considered: Google Safe Browsing lookup (external dependency, latency)
++
++### ADR-03: 302 + Cache-Control: no-store for redirects
++
++Every click must reach the service for analytics; 301 is cached by browsers.
++
++Alternatives considered: 301 Moved Permanently (cheaper, but under-counts)
++
++### ADR-04: Bounded in-process TTL cache on the redirect path
++
++Meets p95 < 50 ms with no new infrastructure; TTL bounds staleness, delete invalidates.
++
++Alternatives considered: Redis/CDN edge cache (needed only for p95 < 10 ms or multi-instance)
++
++### ADR-05: Unique visitors via HMAC(secret, day | IP | UA), truncated
++
++Counts uniques per day without storing personal data; the daily key prevents tracking a visitor across days.
++
++Alternatives considered: Store raw IPs (personal data, needs legal basis); Cookies (consent banner needed)
++
++### ADR-06: Validate targets at the boundary; never fetch them
++
++Blocks script schemes, credential spoofing and internal hosts without network I/O.
++
++Alternatives considered: Fetch-and-inspect targets (SSRF risk, latency)
++
++## Assumptions
++
++- Q-PERF: assumed 'p95 < 50 ms in-process (read-through cache, no new infra)' (non-blocking; confirm or override)
++- Q-SAFETY: assumed 'Add a configurable domain denylist for known-bad domains' (non-blocking; confirm or override)
+--- /dev/null
++++ b/openapi.json
+@@ -0,0 +1,879 @@
++{
++  "components": {
++    "schemas": {
++      "CreateLinkRequest": {
++        "additionalProperties": false,
++        "properties": {
++          "alias": {
++            "anyOf": [
++              {
++                "maxLength": 32,
++                "minLength": 3,
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "examples": [
++              "spring-sale"
++            ],
++            "title": "Alias"
++          },
++          "expires_at": {
++            "anyOf": [
++              {
++                "format": "date-time",
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "ISO-8601; must be in the future",
++            "title": "Expires At"
++          },
++          "url": {
++            "examples": [
++              "https://example.com/a/long/path"
++            ],
++            "maxLength": 2048,
++            "title": "Url",
++            "type": "string"
++          }
++        },
++        "required": [
++          "url"
++        ],
++        "title": "CreateLinkRequest",
++        "type": "object"
++      },
++      "DailyClicks": {
++        "properties": {
++          "clicks": {
++            "title": "Clicks",
++            "type": "integer"
++          },
++          "date": {
++            "title": "Date",
++            "type": "string"
++          }
++        },
++        "required": [
++          "date",
++          "clicks"
++        ],
++        "title": "DailyClicks",
++        "type": "object"
++      },
++      "ErrorResponse": {
++        "properties": {
++          "detail": {
++            "title": "Detail",
++            "type": "string"
++          },
++          "error": {
++            "title": "Error",
++            "type": "string"
++          },
++          "request_id": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Request Id"
++          }
++        },
++        "required": [
++          "error",
++          "detail"
++        ],
++        "title": "ErrorResponse",
++        "type": "object"
++      },
++      "LinkResponse": {
++        "properties": {
++          "click_count": {
++            "title": "Click Count",
++            "type": "integer"
++          },
++          "code": {
++            "title": "Code",
++            "type": "string"
++          },
++          "created_at": {
++            "format": "date-time",
++            "title": "Created At",
++            "type": "string"
++          },
++          "expires_at": {
++            "anyOf": [
++              {
++                "format": "date-time",
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Expires At"
++          },
++          "short_url": {
++            "title": "Short Url",
++            "type": "string"
++          },
++          "target_url": {
++            "title": "Target Url",
++            "type": "string"
++          }
++        },
++        "required": [
++          "code",
++          "short_url",
++          "target_url",
++          "created_at",
++          "expires_at",
++          "click_count"
++        ],
++        "title": "LinkResponse",
++        "type": "object"
++      },
++      "ReferrerCount": {
++        "properties": {
++          "clicks": {
++            "title": "Clicks",
++            "type": "integer"
++          },
++          "host": {
++            "title": "Host",
++            "type": "string"
++          }
++        },
++        "required": [
++          "host",
++          "clicks"
++        ],
++        "title": "ReferrerCount",
++        "type": "object"
++      },
++      "StatsResponse": {
++        "properties": {
++          "code": {
++            "title": "Code",
++            "type": "string"
++          },
++          "daily": {
++            "items": {
++              "$ref": "#/components/schemas/DailyClicks"
++            },
++            "title": "Daily",
++            "type": "array"
++          },
++          "top_referrers": {
++            "items": {
++              "$ref": "#/components/schemas/ReferrerCount"
++            },
++            "title": "Top Referrers",
++            "type": "array"
++          },
++          "total_clicks": {
++            "title": "Total Clicks",
++            "type": "integer"
++          },
++          "unique_visitors": {
++            "default": 0,
++            "description": "Daily-unique visitors summed over the window (no IPs stored)",
++            "title": "Unique Visitors",
++            "type": "integer"
++          }
++        },
++        "required": [
++          "code",
++          "total_clicks",
++          "daily",
++          "top_referrers"
++        ],
++        "title": "StatsResponse",
++        "type": "object"
++      }
++    }
++  },
++  "info": {
++    "title": "URL Shortener",
++    "version": "1.0.0"
++  },
++  "openapi": "3.1.0",
++  "paths": {
++    "/api/v1/links": {
++      "post": {
++        "operationId": "create_link_api_v1_links_post",
++        "parameters": [
++          {
++            "in": "header",
++            "name": "idempotency-key",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "maxLength": 128,
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Idempotency-Key"
++            }
++          },
++          {
++            "in": "header",
++            "name": "x-api-key",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "X-Api-Key"
++            }
++          }
++        ],
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/CreateLinkRequest"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "201": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/LinkResponse"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "400": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Bad Request"
++          },
++          "401": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unauthorized"
++          },
++          "404": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Not Found"
++          },
++          "409": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Conflict"
++          },
++          "410": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Gone"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unprocessable Entity"
++          },
++          "429": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Too Many Requests"
++          }
++        },
++        "summary": "Create Link",
++        "tags": [
++          "links"
++        ]
++      }
++    },
++    "/api/v1/links/{code}": {
++      "delete": {
++        "operationId": "delete_link_api_v1_links__code__delete",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "code",
++            "required": true,
++            "schema": {
++              "title": "Code",
++              "type": "string"
++            }
++          },
++          {
++            "in": "header",
++            "name": "x-api-key",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "X-Api-Key"
++            }
++          }
++        ],
++        "responses": {
++          "204": {
++            "description": "Successful Response"
++          },
++          "400": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Bad Request"
++          },
++          "401": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unauthorized"
++          },
++          "404": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Not Found"
++          },
++          "409": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Conflict"
++          },
++          "410": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Gone"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unprocessable Entity"
++          },
++          "429": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Too Many Requests"
++          }
++        },
++        "summary": "Delete Link",
++        "tags": [
++          "links"
++        ]
++      },
++      "get": {
++        "operationId": "get_link_api_v1_links__code__get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "code",
++            "required": true,
++            "schema": {
++              "title": "Code",
++              "type": "string"
++            }
++          },
++          {
++            "in": "header",
++            "name": "x-api-key",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "X-Api-Key"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/LinkResponse"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "400": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Bad Request"
++          },
++          "401": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unauthorized"
++          },
++          "404": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Not Found"
++          },
++          "409": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Conflict"
++          },
++          "410": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Gone"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unprocessable Entity"
++          },
++          "429": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Too Many Requests"
++          }
++        },
++        "summary": "Get Link",
++        "tags": [
++          "links"
++        ]
++      }
++    },
++    "/api/v1/links/{code}/stats": {
++      "get": {
++        "operationId": "link_stats_api_v1_links__code__stats_get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "code",
++            "required": true,
++            "schema": {
++              "title": "Code",
++              "type": "string"
++            }
++          },
++          {
++            "in": "query",
++            "name": "days",
++            "required": false,
++            "schema": {
++              "default": 30,
++              "title": "Days",
++              "type": "integer"
++            }
++          },
++          {
++            "in": "header",
++            "name": "x-api-key",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "X-Api-Key"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/StatsResponse"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "400": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Bad Request"
++          },
++          "401": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unauthorized"
++          },
++          "404": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Not Found"
++          },
++          "409": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Conflict"
++          },
++          "410": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Gone"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unprocessable Entity"
++          },
++          "429": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Too Many Requests"
++          }
++        },
++        "summary": "Link Stats",
++        "tags": [
++          "analytics"
++        ]
++      }
++    },
++    "/healthz": {
++      "get": {
++        "operationId": "healthz_healthz_get",
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": {
++                    "type": "string"
++                  },
++                  "title": "Response Healthz Healthz Get",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          }
++        },
++        "summary": "Healthz",
++        "tags": [
++          "ops"
++        ]
++      }
++    },
++    "/readyz": {
++      "get": {
++        "operationId": "readyz_readyz_get",
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {}
++              }
++            },
++            "description": "Successful Response"
++          }
++        },
++        "summary": "Readyz",
++        "tags": [
++          "ops"
++        ]
++      }
++    },
++    "/{code}": {
++      "get": {
++        "operationId": "follow__code__get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "code",
++            "required": true,
++            "schema": {
++              "title": "Code",
++              "type": "string"
++            }
++          },
++          {
++            "in": "header",
++            "name": "referer",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Referer"
++            }
++          },
++          {
++            "in": "header",
++            "name": "user-agent",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "User-Agent"
++            }
++          }
++        ],
++        "responses": {
++          "302": {
++            "content": {
++              "application/json": {
++                "schema": {}
++              }
++            },
++            "description": "Successful Response"
++          },
++          "400": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Bad Request"
++          },
++          "401": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unauthorized"
++          },
++          "404": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Not Found"
++          },
++          "409": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Conflict"
++          },
++          "410": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Gone"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Unprocessable Entity"
++          },
++          "429": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/ErrorResponse"
++                }
++              }
++            },
++            "description": "Too Many Requests"
++          }
++        },
++        "summary": "Follow",
++        "tags": [
++          "redirect"
++        ]
++      }
++    }
++  }
++}
